@@ -17,6 +17,8 @@
 #include <RTClib.h>
 #include <rom/rtc.h> 
 #include "locallog.hpp"
+#include "extlog_influxdb.h"
+#include "common.h"
 
 #define TIME_TO_SLEEP       3 * 60 * 1000   //In AP mode, if there is no client connection after timeout, the system will enter sleep mode.
 
@@ -31,18 +33,7 @@ typedef enum {
     VOLTAGE_SENSOR_ID,
 } sensor_id_t;
 
-typedef struct {
-    uint32_t timestamp;     /**< time is in milliseconds */
-    float temperature;      /**< temperature is in degrees centigrade (Celsius) */
-    float light;            /**< light in SI lux units */
-    float pressure;         /**< pressure in hectopascal (hPa) */
-    float humidity;         /**<  humidity in percent */
-    float altitude;         /**<  altitude in m */
-    float voltage;           /**< voltage in volts (V) */
-    uint8_t soli;           //Percentage of soil
-    uint8_t salt;           //Percentage of salt
-} higrow_sensors_event_t;
-
+higrow_sensors_event_buff_t sensors_events;
 
 AsyncWebServer      server(80);
 ESPDash             dashboard(&server);
@@ -634,6 +625,8 @@ void loop()
 
         loopLoRa(&val);
 
+        sensors_events.put(val);
+
         TimeSpan ts = TimeSpan((timestamp - timestamp1hr)/1000);
         if (ts.minutes() >= 10) //report data
         {
@@ -802,7 +795,9 @@ void loopSendData(higrow_sensors_event_t *val)
     char *packet = cJSON_Print(root);
 
     llog_d("Send data: %s", String(packet).c_str());
-//TODO: implement
+
+    writeLogInfo(&sensors_events);
+
 }
 
 
