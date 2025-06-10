@@ -14,6 +14,9 @@
 #include <Adafruit_NeoPixel.h>
 #include "DHT.h"
 #include "configuration.h"
+#include <RTClib.h>
+#include <rom/rtc.h> 
+#include "locallog.hpp"
 
 #define TIME_TO_SLEEP       3 * 60 * 1000   //In AP mode, if there is no client connection after timeout, the system will enter sleep mode.
 
@@ -45,7 +48,7 @@ AsyncWebServer      server(80);
 ESPDash             dashboard(&server);
 
 Button2             button(BOOT_PIN);
-Button2             useButton(USER_BUTTON);
+Button2             useButton(USER_BUTTON, INPUT_PULLUP, DEBOUNCE_MS);
 
 BH1750              lightMeter(OB_BH1750_ADDRESS);  //0x23
 DHT                 dht(DHT1x_PIN, DHTTYPE);
@@ -64,6 +67,7 @@ bool                    has_sht3xSensor = false;
 bool                    has_ds18b20     = false;
 bool                    has_dht11       = false;
 
+uint64_t                timestamp1hr    = 0;
 uint64_t                timestamp       = 0;
 uint8_t                 ds18b20Addr[8];
 uint8_t                 ds18b20Type;
@@ -88,6 +92,7 @@ void    setupLoRa();
 void    loopLoRa(higrow_sensors_event_t *val);
 void    deviceProbe(TwoWire &t);
 float   getDsTemperature(void);
+void    loopSendData(higrow_sensors_event_t *val);
 
 void smartConfigStart(Button2 &b)
 {
@@ -127,6 +132,20 @@ void sleepHandler(Button2 &b)
     deviceSleep();
 }
 
+void wifiSwithHandler(Button2 &b)
+{
+    if (WiFi.getMode() != WIFI_MODE_NULL)
+    {
+        Serial.println("Disable wifi!");
+        WiFi.mode(WIFI_MODE_NULL); //disable wifi
+    }
+    else
+    {
+        Serial.println("Enable wifi!");
+        WiFi.mode(WIFI_MODE_AP); //disable wifi
+    }
+}
+
 TimerHandle_t sleepTimer;
 
 void wifi_ap_connect_timeout(WiFiEvent_t event, WiFiEventInfo_t info)
@@ -151,7 +170,7 @@ void setupWiFi()
 
     sleepTimer = xTimerCreate("timer", pdTICKS_TO_MS(TIME_TO_SLEEP), pdFALSE, NULL, [](TimerHandle_t timer) {
         WiFi.mode(WIFI_MODE_NULL);
-        deviceSleep();
+        //deviceSleep();
     });
 
     xTimerStart(sleepTimer, portMAX_DELAY);
@@ -409,6 +428,9 @@ void setup()
 
     button.setLongClickHandler(smartConfigStart);
     useButton.setLongClickHandler(sleepHandler);
+    useButton.setClickHandler(wifiSwithHandler);
+
+    wakeup_reason();
 
     /* *
     * Warning:
@@ -542,11 +564,17 @@ void setup()
 
 void loop()
 {
+    uint8_t wake_reason = (uint8_t)esp_sleep_get_wakeup_cause();
+
     button.loop();
     useButton.loop();
 
-    if (millis() - timestamp > 1000) {
+    if (wake_reason == ESP_SLEEP_WAKEUP_TIMER 
+     || (millis() - timestamp > 60*1000)) {        
+
         timestamp = millis();
+
+        llog_d("Collect data...");
 
         higrow_sensors_event_t val = {0};
 
@@ -605,10 +633,37 @@ void loop()
         dashboard.sendUpdates();
 
         loopLoRa(&val);
+
+        TimeSpan ts = TimeSpan((timestamp - timestamp1hr)/1000);
+        if (ts.minutes() >= 10) //report data
+        {
+            timestamp1hr = timestamp;
+
+            llog_d("Report data...");
+
+            loopSendData(&val);
+        }
+    }   
+
+    if (millis() > 5*60*1000)
+    {
+        if (WiFi.getMode() != WIFI_MODE_NULL)
+        {
+            llog_d("Disable wifi!");
+            WiFi.mode(WIFI_MODE_NULL); //disable wifi
+        }
+        else
+        {
+            llog_d("Sleep...");
+
+            int sleep_time_seconds = 60;
+            esp_sleep_enable_timer_wakeup((uint64_t)sleep_time_seconds*1000000L);
+            //esp_sleep_enable_ext1_wakeup(_BV(35), ESP_EXT1_WAKEUP_ALL_LOW); // GPIO35 MASK
+
+            esp_light_sleep_start();
+        }
     }
 }
-
-
 
 void deviceProbe(TwoWire &t)
 {
@@ -685,6 +740,69 @@ void loopLoRa(higrow_sensors_event_t *val)
     LoRa.endPacket();
 
     cJSON_Delete(root);
+}
+
+String print_reset_reason(RESET_REASON reason) {
+    String ret = "";
+    switch ( reason) {
+        case 1 : ret = "POWERON_RESET"; break;
+        case 3 : ret = "SW_RESET"; break;
+        case 4 : ret = "OWDT_RESET"; break;
+        case 5 : ret = "DEEPSLEEP_RESET"; break;
+        case 6 : ret = "SDIO_RESET"; break; 
+        case 7 : ret = "TG0WDT_SYS_RESET"; break;
+        case 8 : ret = "TG1WDT_SYS_RESET"; break;
+        case 9 : ret = "RTCWDT_SYS_RESET"; break;
+        case 10 : ret = "INTRUSION_RESET"; break;
+        case 11 : ret = "TGWDT_CPU_RESET"; break;
+        case 12 : ret = "SW_CPU_RESET"; break;
+        case 13 : ret = "RTCWDT_CPU_RESET"; break;
+        case 14 : ret = "EXT_CPU_RESET"; break;
+        case 15 : ret = "RTCWDT_BROWN_OUT_RESET"; break;
+        case 16 : ret = "RTCWDT_RTC_RESET"; break;
+        default : ret = "UNKNOWN";
+    }
+    return ret;
+}
+
+
+uint8_t wakeup_reason() {
+
+    uint8_t ret = (uint8_t)esp_sleep_get_wakeup_cause();
+
+    Serial.println("CPU0 reset reason: " + print_reset_reason(rtc_get_reset_reason(0)));
+    Serial.println("CPU1 reset reason: " + print_reset_reason(rtc_get_reset_reason(1)) + "\n");
+    
+    switch(ret){
+        //dbgPrintln("Location variable: " + String(curr_loc));
+        
+        case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("EXT0 Wakeup by ext signal EXT0"); break;       
+        case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("EXT1 Wakeup by ext signal EXT1"); break;
+        case ESP_SLEEP_WAKEUP_TIMER : Serial.println("TIMER Wakeup"); break;
+        case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("TOUCHPAD Wakeupd"); break;
+        case ESP_SLEEP_WAKEUP_ULP : Serial.println("ULP Wakeup by ULP program"); break;
+        default : Serial.println("WAKEUP not caused by deep sleep: " + String(ret)); 
+        break;
+    }
+
+    return ret;
+}
+
+void loopSendData(higrow_sensors_event_t *val)
+{
+
+    cJSON *root =  cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "Timestamp", String(val->timestamp).c_str());
+    cJSON_AddStringToObject(root, "L", String(val->light).c_str());
+    cJSON_AddStringToObject(root, "S", String(val->soli).c_str());
+    cJSON_AddStringToObject(root, "A", String(val->salt).c_str());
+    cJSON_AddStringToObject(root, "V", String(val->voltage).c_str());
+    cJSON_AddStringToObject(root, "T", String(val->temperature).c_str());
+
+    char *packet = cJSON_Print(root);
+
+    llog_d("Send data: %s", String(packet).c_str());
+//TODO: implement
 }
 
 
